@@ -29,6 +29,7 @@ def _tana_nombre_descarga(nombre_original, extension=".xlsx"):
     return f"{nombre}{extension.lower()}"
 
 import streamlit as st
+
 try:
     import extra_streamlit_components as stx
 except Exception:
@@ -55,6 +56,16 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+@st.cache_data(show_spinner=False)
+def _leda_banner_uri():
+    """Logo completo (banner) en base64, leído una sola vez."""
+    import base64 as _b64h
+    _p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LOGO_LEDA_banner.jpg")
+    if not os.path.exists(_p):
+        return ""
+    with open(_p, "rb") as _f:
+        return "data:image/jpeg;base64," + _b64h.b64encode(_f.read()).decode()
 
 # ============================================================
 # AUTENTICACIÓN LEDA — SUPABASE
@@ -360,31 +371,28 @@ def _tana_auth_screen():
     if st.session_state.get("tana_no_restore"):
         _tana_emit_cookie_script(clear=True)  # cierre de sesión o token vencido
 
-    _auth_logo_html = ""
-    _auth_logo_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "LOGO_LEDA_web.png")
-    if os.path.exists(_auth_logo_file):
-        import base64 as _b64a
-        with open(_auth_logo_file, "rb") as _alf:
-            _auth_logo_html = (
-                "<div style='text-align:center;margin-bottom:4px;'><img src='data:image/png;base64,"
-                + _b64a.b64encode(_alf.read()).decode()
-                + "' alt='LEDA' style='width:120px;height:auto;'></div>"
-            )
+    _banner_uri = _leda_banner_uri()
+    if _banner_uri:
+        _auth_head = (
+            "<img src='" + _banner_uri + "' alt='LEDA - Tu asistente contable con IA' "
+            "style='display:block;width:100%;height:auto;border-radius:14px;'>"
+        )
+    else:
+        _auth_head = (
+            "<div class='tana-auth-logo'>LEDA</div>"
+            "<div class='tana-auth-sub'>Inteligencia Artificial Contable</div>"
+        )
 
     st.markdown("""
     <style>
-    .tana-auth-wrap { max-width: 470px; margin: 7vh auto 0 auto; padding: 0 16px; }
-    .tana-auth-card { background:#fff; border:1px solid #DDE8EF; border-radius:20px; padding:30px 28px; box-shadow:0 8px 30px rgba(18,48,74,.08); }
-    .tana-auth-logo { text-align:center; font-size:34px; font-weight:900; color:#12304A; margin-bottom:6px; }
-    .tana-auth-sub { text-align:center; color:#6B7B87; margin-bottom:24px; }
+    .tana-auth-wrap { max-width: 470px; margin: 5vh auto 0 auto; padding: 0 16px; }
+    .tana-auth-card { background:#fff; border:1px solid #DDE8EF; border-radius:20px; padding:14px; box-shadow:0 8px 30px rgba(18,48,74,.08); }
+    .tana-auth-logo { text-align:center; font-size:34px; font-weight:900; color:#12304A; margin-bottom:6px; padding-top:16px; }
+    .tana-auth-sub { text-align:center; color:#6B7B87; margin-bottom:16px; padding-bottom:10px; }
     </style>
     <div class="tana-auth-wrap">
-      <div class="tana-auth-card">
-        __CORA_LOGO__
-        <div class="tana-auth-logo">LEDA</div>
-        <div class="tana-auth-sub">Inteligencia Artificial Contable</div>
-    </div></div>
-    """.replace("__CORA_LOGO__", _auth_logo_html), unsafe_allow_html=True)
+      <div class="tana-auth-card">__LEDA_HEAD__</div></div>
+    """.replace("__LEDA_HEAD__", _auth_head), unsafe_allow_html=True)
 
     # El formulario real queda debajo del encabezado visual.
     _, center, _ = st.columns([0.15, 0.70, 0.15])
@@ -3084,18 +3092,17 @@ def _tana_chat_add(role, content):
     st.session_state["tana_chat"].append({"role": role, "content": content})
 
 if not st.session_state["tana_chat"]:
-    _logo_html = ""
-    if os.path.exists(LOGO_PATH):
-        import base64 as _b64
-        with open(LOGO_PATH, "rb") as _lf:
-            _logo_b64 = _b64.b64encode(_lf.read()).decode()
+    _wb = _leda_banner_uri()
+    if _wb:
         _logo_html = (
-            "<img src='data:" + LOGO_MIME + ";base64," + _logo_b64 + "' alt='LEDA' "
-            "style='width:96px;height:auto;background:#fff;padding:14px;border-radius:24px;"
-            "box-shadow:0 4px 18px rgba(0,0,0,.28);'>"
+            "<img src='" + _wb + "' alt='LEDA' "
+            "style='width:min(440px,92%);height:auto;border-radius:24px;"
+            "box-shadow:0 6px 24px rgba(0,0,0,.30);'>"
         )
+    else:
+        _logo_html = ""
     st.markdown(
-        '<div class="tana-welcome" style="text-align:center; padding:70px 0 20px 0;">'
+        '<div class="tana-welcome" style="text-align:center; padding:36px 0 20px 0;">'
         + _logo_html +
         '<div class="tana-welcome-title" style="font-size:26px;font-weight:800;margin-top:14px;">¿Qué monografía resolvemos hoy?</div>'
         '<div class="tana-welcome-subtitle" style="font-size:14.5px;margin-top:6px;">'
