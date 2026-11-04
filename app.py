@@ -2977,6 +2977,190 @@ st.components.v1.html(
     height=0,
 )
 
+# ============================================================
+# CRÉDITOS, TOPE DIARIO, SESIÓN ÚNICA Y PANEL DE ADMINISTRADOR
+# Solo se activa con LEDA_CREDITOS_ACTIVOS = "1" en Secrets (y tras ejecutar
+# leda_creditos.sql en Supabase). Mientras esté apagado, LEDA funciona igual
+# que antes. Toda la lógica de cuentas vive en funciones SQL; la clave de
+# servicio solo se usa desde el servidor de Streamlit.
+# ============================================================
+def _leda_cfg(name, default=""):
+    try:
+        return str(_secret_or_env(name, default) or default).strip()
+    except Exception:
+        return str(default)
+
+
+def _leda_cfg_int(name, default):
+    try:
+        return int(float(_leda_cfg(name, str(default))))
+    except Exception:
+        return int(default)
+
+
+LEDA_CREDITOS_ACTIVOS = _leda_cfg("LEDA_CREDITOS_ACTIVOS").lower() in ("1", "true", "si", "sí", "yes")
+LEDA_ADMINS = {
+    _e.strip().lower()
+    for _e in _leda_cfg("LEDA_ADMIN_EMAILS").replace(";", ",").split(",")
+    if _e.strip()
+}
+LEDA_ES_ADMIN = TANA_AUTH_EMAIL.strip().lower() in LEDA_ADMINS
+LEDA_TOPE_DIARIO = _leda_cfg_int("LEDA_TOPE_DIARIO", 5)
+LEDA_TOPE_REABRIR = _leda_cfg_int("LEDA_TOPE_REABRIR", 15)
+LEDA_GRATIS = _leda_cfg_int("LEDA_CREDITOS_GRATIS", 1)
+LEDA_VENCE_DEFAULT = _leda_cfg("LEDA_VENCE_DEFAULT", "2026-12-31")
+LEDA_PAGO_TEXTO = _leda_cfg(
+    "LEDA_PAGO_TEXTO",
+    "Para recargar créditos, comunícate con el administrador de LEDA e indícale tu correo: {email}.",
+)
+
+
+def _leda_fecha(valor):
+    try:
+        _y, _m, _d = str(valor)[:10].split("-")
+        return _d + "/" + _m + "/" + _y
+    except Exception:
+        return str(valor or "")
+
+
+def _leda_rpc(nombre, payload):
+    """Llama a una función SQL de Supabase. Devuelve dict o None si falló."""
+    _previo = st.session_state.get("tana_history_last_error")
+    try:
+        _r = _tana_history_request("rpc/" + nombre, method="POST", payload=payload)
+    except Exception as _exc:
+        _r = None
+        st.session_state["leda_ultimo_error"] = str(_exc)[:300]
+    if _r is None:
+        # no mezclar este error con el aviso del historial
+        st.session_state["leda_ultimo_error"] = str(st.session_state.get("tana_history_last_error") or "")
+        if _previo is None:
+            st.session_state.pop("tana_history_last_error", None)
+        else:
+            st.session_state["tana_history_last_error"] = _previo
+        return None
+    if isinstance(_r, list) and _r and isinstance(_r[0], dict):
+        _r = _r[0]
+    return _r if isinstance(_r, dict) else None
+
+
+def _leda_uid():
+    return _tana_history_user_id()
+
+
+def _leda_estado(force=False):
+    """Estado de la cuenta; crea la cuenta (con el crédito de bienvenida) la primera vez."""
+    if not LEDA_CREDITOS_ACTIVOS:
+        return None
+    _ahora = time.time()
+    _c = st.session_state.get("leda_estado")
+    if _c and not force and _ahora - _c.get("t", 0) < 20:
+        return _c.get("d")
+    _d = _leda_rpc("leda_estado", {
+        "p_user": _leda_uid(),
+        "p_email": TANA_AUTH_EMAIL.strip().lower(),
+        "p_gratis": LEDA_GRATIS,
+        "p_tope": LEDA_TOPE_DIARIO,
+    })
+    st.session_state["leda_estado"] = {"t": _ahora, "d": _d}
+    return _d
+
+
+def _leda_mensaje_bloqueo(est):
+    _motivo = (est or {}).get("motivo")
+    if _motivo == "tope_diario":
+        return ("Alcanzaste el límite de " + str(LEDA_TOPE_DIARIO)
+                + " trabajos por hoy. Vuelve mañana para seguir.")
+    _pago = LEDA_PAGO_TEXTO.replace("{email}", TANA_AUTH_EMAIL)
+    if _motivo == "vencidos":
+        return ("Tus créditos vencieron el " + _leda_fecha((est or {}).get("vence")) + ". " + _pago)
+    return "Te quedaste sin créditos. " + _pago
+
+
+def _leda_puede_usar():
+    """(ok, mensaje). Siempre ok si los créditos no están activos o eres administrador."""
+    if not LEDA_CREDITOS_ACTIVOS or LEDA_ES_ADMIN:
+        return True, ""
+    _est = _leda_estado(force=True)
+    if _est is None:
+        return True, ""   # si la base no responde, no se bloquea al estudiante
+    if _est.get("puede"):
+        return True, ""
+    return False, _leda_mensaje_bloqueo(_est)
+
+
+def _leda_cobrar(detalle):
+    """Descuenta 1 crédito (solo tras un resultado entregado). Nunca lanza errores."""
+    try:
+        if not LEDA_CREDITOS_ACTIVOS or LEDA_ES_ADMIN:
+            return
+        _leda_rpc("leda_consumir", {"p_user": _leda_uid(), "p_detalle": str(detalle)[:200]})
+        st.session_state.pop("leda_estado", None)
+    except Exception:
+        pass
+
+
+def _leda_gate_reapertura(detalle):
+    """Abrir un trabajo del historial no cuesta crédito, pero tiene un tope diario."""
+    try:
+        if not LEDA_CREDITOS_ACTIVOS or LEDA_ES_ADMIN:
+            return True, ""
+        _r = _leda_rpc("leda_reapertura", {
+            "p_user": _leda_uid(), "p_detalle": str(detalle)[:200], "p_tope": LEDA_TOPE_REABRIR,
+        })
+        if _r is None or _r.get("ok"):
+            return True, ""
+        return False, ("Alcanzaste el límite de " + str(LEDA_TOPE_REABRIR)
+                       + " aperturas del historial por hoy. Vuelve mañana.")
+    except Exception:
+        return True, ""
+
+
+def _leda_cobro_final(pendiente, hubo_errores):
+    """Cobra el crédito solo si el resultado salió sin errores de validación."""
+    try:
+        if not pendiente or not LEDA_CREDITOS_ACTIVOS or LEDA_ES_ADMIN:
+            return
+        if hubo_errores:
+            _txt = ("No se descontó ningún crédito porque LEDA detectó inconsistencias en el resultado. "
+                    "Revisa las alertas o vuelve a intentarlo.")
+            st.warning("⚠️ " + _txt)
+            _tana_chat_add("assistant", "⚠️ " + _txt)
+            return
+        _leda_cobrar("Monografía: " + str(pendiente))
+    except Exception:
+        pass
+
+
+def _leda_verificar_sesion():
+    """Una sola sesión activa por cuenta: si entras desde otro dispositivo, la anterior se cierra."""
+    if not LEDA_CREDITOS_ACTIVOS or LEDA_ES_ADMIN:
+        return
+    import uuid as _uuid
+    _sid = st.session_state.setdefault("leda_sesion_id", _uuid.uuid4().hex)
+    _ahora = time.time()
+    if not st.session_state.get("leda_sesion_registrada"):
+        _leda_estado(force=True)   # asegura que la cuenta exista
+        _r = _leda_rpc("leda_sesion", {"p_user": _leda_uid(), "p_sesion": _sid, "p_registrar": True})
+        if _r is not None:
+            st.session_state["leda_sesion_registrada"] = True
+            st.session_state["leda_sesion_chk"] = _ahora
+        return
+    if _ahora - st.session_state.get("leda_sesion_chk", 0) < 45:
+        return
+    st.session_state["leda_sesion_chk"] = _ahora
+    _r = _leda_rpc("leda_sesion", {"p_user": _leda_uid(), "p_sesion": _sid, "p_registrar": False})
+    if _r is not None and _r.get("ok") is False:
+        st.error("Tu cuenta se abrió en otro dispositivo. LEDA permite una sola sesión activa por cuenta.")
+        if st.button("Usar LEDA en este dispositivo", key="leda_tomar_sesion"):
+            st.session_state.pop("leda_sesion_registrada", None)
+            st.rerun()
+        st.stop()
+
+
+_leda_verificar_sesion()
+
+
 with st.sidebar:
     logo_col, title_col = st.columns([0.35, 1])
     with logo_col:
@@ -3021,6 +3205,22 @@ with st.sidebar:
             _tana_retry_history_sync()
             st.rerun()
 
+    if LEDA_CREDITOS_ACTIVOS:
+        if LEDA_ES_ADMIN:
+            st.caption("👑 Administrador · uso sin límite")
+        else:
+            _est_sb = _leda_estado()
+            if _est_sb:
+                _disp = int(_est_sb.get("disponibles") or 0)
+                st.markdown("🎟️ **Créditos disponibles: " + str(_disp) + "**")
+                _det = []
+                if int(_est_sb.get("gratis") or 0) > 0:
+                    _det.append(str(_est_sb.get("gratis")) + " gratis")
+                if int(_est_sb.get("vigentes") or 0) > 0:
+                    _det.append(str(_est_sb.get("vigentes")) + " hasta el " + _leda_fecha(_est_sb.get("vence")))
+                if _det:
+                    st.caption(" · ".join(_det))
+                st.caption("Hoy: " + str(_est_sb.get("usos_hoy") or 0) + " de " + str(LEDA_TOPE_DIARIO) + " trabajos")
     st.markdown(
         '<div class="tana-side-account">'
         '<div class="tana-avatar">C</div><span>' + TANA_AUTH_EMAIL.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + '</span></div>',
@@ -3453,8 +3653,13 @@ if _modo_excel:
                     _log_excel.append({"role": "assistant", "content": _resp_x})
                     _tana_save_history_excel(_nombre_x, _excel_estado_historial(_nombre_x, _log_excel, _prev, st.session_state.get("asientos_contables") if st.session_state.get("tana_desde_excel") else None))
                     st.rerun()
+                _ok_x, _msg_x = _leda_puede_usar()
+                if not _ok_x:
+                    st.warning(_msg_x)
+                    st.stop()
                 _excel_result = _excel_auditar_y_corregir(_archivo_excel, _q_excel, previos=_prev)
                 _excel_result["resultado"]["_archivo"] = _nombre_x
+                _leda_cobrar("Excel: " + str(_nombre_x))
                 st.session_state["excel_auditoria"] = _excel_result["resultado"]
                 st.session_state["excel_auditoria_buffer"] = _excel_result["buffer"]
                 st.session_state["excel_auditoria_filename"] = _excel_result["filename"]
@@ -3528,6 +3733,10 @@ if uploaded_file and Path(uploaded_file.name).suffix.lower() not in {".xls", ".x
             "registro_compras", "registro_ventas", "kardex",
         ):
             st.session_state.pop(_key, None)
+        _ok_uso, _msg_uso = _leda_puede_usar()
+        if not _ok_uso:
+            st.warning(_msg_uso)
+            st.stop()
         with st.spinner("LEDA está leyendo y procesando la monografía…"):
             try:
                 extracted = extract_with_gemini(uploaded_file)
@@ -3535,6 +3744,7 @@ if uploaded_file and Path(uploaded_file.name).suffix.lower() not in {".xls", ".x
                 st.session_state["monografia_texto"] = extraction_to_text(extracted)
                 st.session_state["monografia_nombre"] = uploaded_file.name
                 st.session_state["tana_file_signature"] = file_signature
+                st.session_state["leda_cobro_pendiente"] = uploaded_file.name
                 st.session_state.pop("tana_desde_excel", None)
                 # Fuerza una nueva ejecución para continuar con el desarrollo.
                 st.rerun()
@@ -4667,56 +4877,66 @@ def resolve_asientos_with_gemini():
     return data, pcge_map
 
 if "monografia_json" in st.session_state and "asientos_contables" not in st.session_state:
+    _nuevo_trabajo = bool(st.session_state.get("leda_cobro_pendiente")) and st.session_state.get("leda_cobro_pendiente") == st.session_state.get("monografia_nombre")
+    if not _nuevo_trabajo and st.session_state.get("leda_reapertura_ok") != st.session_state.get("monografia_nombre"):
+        _ok_re, _msg_re = _leda_gate_reapertura(str(st.session_state.get("monografia_nombre", "")))
+        if not _ok_re:
+            st.warning(_msg_re)
+            st.stop()
+        st.session_state["leda_reapertura_ok"] = st.session_state.get("monografia_nombre")
     with st.spinner("LEDA está desarrollando y validando los asientos contables…"):
         try:
-            resolved, pcge_map = resolve_asientos_with_gemini()
-            if isinstance(resolved, dict):
-                asientos_generados = resolved.get("asientos", [])
-                alertas_gemini = resolved.get("alertas", [])
-            elif isinstance(resolved, list):
-                asientos_generados = resolved
-                alertas_gemini = []
-            else:
-                raise ValueError("La respuesta de Gemini no tiene una estructura de asientos válida.")
-            if not isinstance(asientos_generados, list):
-                raise ValueError("La clave 'asientos' de Gemini no contiene una lista.")
+            for _intento in range(2):   # si la validación detecta errores, se reintenta una vez
+                resolved, pcge_map = resolve_asientos_with_gemini()
+                if isinstance(resolved, dict):
+                    asientos_generados = resolved.get("asientos", [])
+                    alertas_gemini = resolved.get("alertas", [])
+                elif isinstance(resolved, list):
+                    asientos_generados = resolved
+                    alertas_gemini = []
+                else:
+                    raise ValueError("La respuesta de Gemini no tiene una estructura de asientos válida.")
+                if not isinstance(asientos_generados, list):
+                    raise ValueError("La clave 'asientos' de Gemini no contiene una lista.")
 
-            registro_compras = resolved.get("registro_compras", []) if isinstance(resolved, dict) else []
-            registro_ventas = resolved.get("registro_ventas", []) if isinstance(resolved, dict) else []
-            kardex = resolved.get("kardex", []) if isinstance(resolved, dict) else []
-            costos = resolved.get("costos", {}) if isinstance(resolved, dict) else {}
-            if not isinstance(costos, dict):
-                costos = {}
-            tipo_empresa = str(
-                resolved.get("tipo_empresa", st.session_state.get("monografia_json", {}).get("tipo_empresa", ""))
-                if isinstance(resolved, dict) else ""
-            ).upper().strip()
-            if tipo_empresa:
-                st.session_state["tipo_empresa"] = tipo_empresa
-            if not isinstance(registro_compras, list):
-                registro_compras = []
-            if not isinstance(registro_ventas, list):
-                registro_ventas = []
-            if not isinstance(kardex, list):
-                kardex = []
+                registro_compras = resolved.get("registro_compras", []) if isinstance(resolved, dict) else []
+                registro_ventas = resolved.get("registro_ventas", []) if isinstance(resolved, dict) else []
+                kardex = resolved.get("kardex", []) if isinstance(resolved, dict) else []
+                costos = resolved.get("costos", {}) if isinstance(resolved, dict) else {}
+                if not isinstance(costos, dict):
+                    costos = {}
+                tipo_empresa = str(
+                    resolved.get("tipo_empresa", st.session_state.get("monografia_json", {}).get("tipo_empresa", ""))
+                    if isinstance(resolved, dict) else ""
+                ).upper().strip()
+                if tipo_empresa:
+                    st.session_state["tipo_empresa"] = tipo_empresa
+                if not isinstance(registro_compras, list):
+                    registro_compras = []
+                if not isinstance(registro_ventas, list):
+                    registro_ventas = []
+                if not isinstance(kardex, list):
+                    kardex = []
 
-            asientos_generados = asegurar_cuenta_79_en_destinos(asientos_generados, pcge_map)
-            asientos_generados = corregir_retiro_socio(asientos_generados, st.session_state.get("monografia_json", {}))
-            asientos_generados = corregir_planilla_neto(asientos_generados)
-            asientos_generados, _aviso_destinos = completar_destinos_gastos(asientos_generados, pcge_map)
-            if _aviso_destinos:
-                alertas_gemini = list(alertas_gemini) + [_aviso_destinos]
+                asientos_generados = asegurar_cuenta_79_en_destinos(asientos_generados, pcge_map)
+                asientos_generados = corregir_retiro_socio(asientos_generados, st.session_state.get("monografia_json", {}))
+                asientos_generados = corregir_planilla_neto(asientos_generados)
+                asientos_generados, _aviso_destinos = completar_destinos_gastos(asientos_generados, pcge_map)
+                if _aviso_destinos:
+                    alertas_gemini = list(alertas_gemini) + [_aviso_destinos]
 
-            # Sincroniza el costo de venta de los asientos con el Kardex
-            # ANTES de validar, para que HT/ERN/ERF hereden el importe
-            # correcto (ambos se calculan a partir de "asientos_contables").
-            alertas_kardex = []
-            if kardex:
-                asientos_generados, alertas_sync = sincronizar_costo_ventas_con_kardex(asientos_generados, kardex)
-                alertas_kardex.extend(alertas_sync)
-                alertas_kardex.extend(validar_kardex(kardex))
+                # Sincroniza el costo de venta de los asientos con el Kardex
+                # ANTES de validar, para que HT/ERN/ERF hereden el importe
+                # correcto (ambos se calculan a partir de "asientos_contables").
+                alertas_kardex = []
+                if kardex:
+                    asientos_generados, alertas_sync = sincronizar_costo_ventas_con_kardex(asientos_generados, kardex)
+                    alertas_kardex.extend(alertas_sync)
+                    alertas_kardex.extend(validar_kardex(kardex))
 
-            valid, errors, warnings = validate_asientos({"asientos": asientos_generados}, pcge_map)
+                valid, errors, warnings = validate_asientos({"asientos": asientos_generados}, pcge_map)
+                if not errors or _intento == 1:
+                    break
             st.session_state["asientos_contables"] = asientos_generados
             st.session_state["asientos_validos"] = valid
             st.session_state["errores_asientos"] = errors
@@ -4725,6 +4945,10 @@ if "monografia_json" in st.session_state and "asientos_contables" not in st.sess
             st.session_state["registro_ventas"] = registro_ventas
             st.session_state["kardex"] = kardex
             st.session_state["costos"] = costos
+            _leda_pend = st.session_state.pop("leda_cobro_pendiente", None)
+            if _leda_pend and _leda_pend == st.session_state.get("monografia_nombre"):
+                _leda_cobro_final(_leda_pend, bool(errors))
+            st.session_state.pop("leda_reapertura_ok", None)
         except Exception as exc:
             st.error(f"No se pudieron desarrollar los asientos: {exc}")
             st.stop()
@@ -6756,3 +6980,76 @@ if st.session_state.get("tana_excel_buffer"):
     )
     if "monografia_nombre" in st.session_state:
         st.caption("La hoja Monografia conserva el texto extraído para revisión.")
+
+
+# ============================================================
+# AVISO DE REVISIÓN Y PANEL DE ADMINISTRADOR
+# ============================================================
+if st.session_state.get("asientos_contables"):
+    st.caption("⚠️ LEDA es una ayuda de estudio: verifica siempre los resultados con tu docente o contador.")
+
+if LEDA_CREDITOS_ACTIVOS and LEDA_ES_ADMIN:
+    with st.expander("👑 Panel de administrador · créditos", expanded=False):
+        _adm_email = st.text_input("Correo del estudiante", key="leda_adm_email").strip().lower()
+        _a1, _a2 = st.columns(2)
+        _adm_cant = _a1.number_input("Créditos a agregar", min_value=1, max_value=500, value=5, step=1, key="leda_adm_cant")
+        _adm_vence = _a2.text_input("Vigencia hasta (AAAA-MM-DD)", value=LEDA_VENCE_DEFAULT, key="leda_adm_vence").strip()
+        _adm_nota = st.text_input("Nota (ej. Yape S/ 5, operación 12345)", key="leda_adm_nota")
+        _b1, _b2 = st.columns(2)
+
+        if _b1.button("➕ Agregar créditos", key="leda_adm_agregar", use_container_width=True):
+            _ok_f = True
+            try:
+                _dt.date.fromisoformat(_adm_vence)
+            except Exception:
+                _ok_f = False
+            if "@" not in _adm_email:
+                st.error("Escribe un correo válido.")
+            elif not _ok_f:
+                st.error("La fecha debe tener el formato AAAA-MM-DD (ejemplo: 2026-12-31).")
+            else:
+                _res = _leda_rpc("leda_agregar", {
+                    "p_email": _adm_email, "p_cantidad": int(_adm_cant), "p_vence": _adm_vence,
+                    "p_nota": _adm_nota, "p_admin": TANA_AUTH_EMAIL,
+                })
+                if _res is None:
+                    st.error("No se pudo conectar con la base de datos: " + str(st.session_state.get("leda_ultimo_error", ""))[:200])
+                elif _res.get("ok"):
+                    st.success("Listo: " + str(_res.get("email")) + " ahora tiene " + str(_res.get("creditos"))
+                               + " créditos pagados, vigentes hasta " + _leda_fecha(_res.get("vence")) + ".")
+                else:
+                    st.error("Ese correo todavía no tiene cuenta en LEDA. Pídele que ingrese al menos una vez y vuelve a intentar.")
+
+        if _b2.button("🔍 Ver cuenta", key="leda_adm_ver", use_container_width=True):
+            if "@" not in _adm_email:
+                st.error("Escribe un correo válido.")
+            else:
+                _q = urlencode({"email": "eq." + _adm_email, "select": "email,creditos_gratis,creditos,vence,actualizado_en", "limit": "1"})
+                _rows = _tana_history_request("leda_cuentas?" + _q)
+                if isinstance(_rows, list) and _rows:
+                    st.dataframe(_rows, use_container_width=True)
+                else:
+                    st.info("No hay una cuenta con ese correo todavía.")
+
+        st.markdown("**Últimos movimientos**")
+        _mq = urlencode({"select": "creado_en,email,tipo,delta,detalle", "order": "creado_en.desc", "limit": "40"})
+        _mov = _tana_history_request("leda_movimientos?" + _mq)
+        if isinstance(_mov, list) and _mov:
+            _lima = _dt.timezone(_dt.timedelta(hours=-5))
+            _filas = []
+            for _m in _mov:
+                try:
+                    _f = _dt.datetime.fromisoformat(str(_m.get("creado_en")).replace("Z", "+00:00")).astimezone(_lima).strftime("%d/%m %H:%M")
+                except Exception:
+                    _f = str(_m.get("creado_en"))
+                _filas.append({"fecha (Lima)": _f, "correo": _m.get("email"), "tipo": _m.get("tipo"),
+                               "créditos": _m.get("delta"), "detalle": _m.get("detalle")})
+            st.dataframe(_filas, use_container_width=True)
+        else:
+            st.caption("Todavía no hay movimientos. Si acabas de activar los créditos, ejecuta primero leda_creditos.sql en Supabase.")
+
+        st.markdown("**Cuentas**")
+        _cq = urlencode({"select": "email,creditos_gratis,creditos,vence,actualizado_en", "order": "actualizado_en.desc", "limit": "100"})
+        _cuentas = _tana_history_request("leda_cuentas?" + _cq)
+        if isinstance(_cuentas, list) and _cuentas:
+            st.dataframe(_cuentas, use_container_width=True)
