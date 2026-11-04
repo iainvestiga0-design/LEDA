@@ -3005,6 +3005,13 @@ LEDA_ADMINS = {
     if _e.strip()
 }
 LEDA_ES_ADMIN = TANA_AUTH_EMAIL.strip().lower() in LEDA_ADMINS
+LEDA_VENDEDORES = {
+    _e.strip().lower()
+    for _e in _leda_cfg("LEDA_VENDEDOR_EMAILS").replace(";", ",").split(",")
+    if _e.strip()
+}
+LEDA_ES_VENDEDOR = (not LEDA_ES_ADMIN) and TANA_AUTH_EMAIL.strip().lower() in LEDA_VENDEDORES
+LEDA_VENDEDOR_MAX = _leda_cfg_int("LEDA_VENDEDOR_MAX", 20)
 LEDA_TOPE_DIARIO = _leda_cfg_int("LEDA_TOPE_DIARIO", 5)
 LEDA_TOPE_REABRIR = _leda_cfg_int("LEDA_TOPE_REABRIR", 15)
 LEDA_GRATIS = _leda_cfg_int("LEDA_CREDITOS_GRATIS", 1)
@@ -3209,6 +3216,8 @@ with st.sidebar:
         if LEDA_ES_ADMIN:
             st.caption("👑 Administrador · uso sin límite")
         else:
+            if LEDA_ES_VENDEDOR:
+                st.caption("🛒 Vendedor · el panel de ventas está al final de la página")
             _est_sb = _leda_estado()
             if _est_sb:
                 _disp = int(_est_sb.get("disponibles") or 0)
@@ -6988,12 +6997,16 @@ if st.session_state.get("tana_excel_buffer"):
 if st.session_state.get("asientos_contables"):
     st.caption("⚠️ LEDA es una ayuda de estudio: verifica siempre los resultados con tu docente o contador.")
 
-if LEDA_CREDITOS_ACTIVOS and LEDA_ES_ADMIN:
-    with st.expander("👑 Panel de administrador · créditos", expanded=False):
+if LEDA_CREDITOS_ACTIVOS and (LEDA_ES_ADMIN or LEDA_ES_VENDEDOR):
+    _titulo_panel = "👑 Panel de administrador · créditos" if LEDA_ES_ADMIN else "🛒 Panel de ventas · créditos"
+    with st.expander(_titulo_panel, expanded=False):
+        if LEDA_ES_VENDEDOR:
+            st.caption("Puedes cargar hasta " + str(LEDA_VENDEDOR_MAX) + " créditos por operación. Cada recarga queda registrada con tu correo.")
         _adm_email = st.text_input("Correo del estudiante", key="leda_adm_email").strip().lower()
         _a1, _a2 = st.columns(2)
-        _adm_cant = _a1.number_input("Créditos a agregar", min_value=1, max_value=500, value=5, step=1, key="leda_adm_cant")
-        _adm_vence = _a2.text_input("Vigencia hasta (AAAA-MM-DD)", value=LEDA_VENCE_DEFAULT, key="leda_adm_vence").strip()
+        _tope_cant = 500 if LEDA_ES_ADMIN else max(1, LEDA_VENDEDOR_MAX)
+        _adm_cant = _a1.number_input("Créditos a agregar", min_value=1, max_value=_tope_cant, value=min(5, _tope_cant), step=1, key="leda_adm_cant")
+        _adm_vence = _a2.text_input("Vigencia hasta (AAAA-MM-DD)", value=LEDA_VENCE_DEFAULT, key="leda_adm_vence", disabled=not LEDA_ES_ADMIN).strip()
         _adm_nota = st.text_input("Nota (ej. Yape S/ 5, operación 12345)", key="leda_adm_nota")
         _b1, _b2 = st.columns(2)
 
@@ -7007,6 +7020,8 @@ if LEDA_CREDITOS_ACTIVOS and LEDA_ES_ADMIN:
                 st.error("Escribe un correo válido.")
             elif not _ok_f:
                 st.error("La fecha debe tener el formato AAAA-MM-DD (ejemplo: 2026-12-31).")
+            elif LEDA_ES_VENDEDOR and _adm_email == TANA_AUTH_EMAIL.strip().lower():
+                st.error("No puedes cargarte créditos a ti mismo. Pídeselo al administrador.")
             else:
                 _res = _leda_rpc("leda_agregar", {
                     "p_email": _adm_email, "p_cantidad": int(_adm_cant), "p_vence": _adm_vence,
@@ -7031,9 +7046,12 @@ if LEDA_CREDITOS_ACTIVOS and LEDA_ES_ADMIN:
                 else:
                     st.info("No hay una cuenta con ese correo todavía.")
 
-        st.markdown("**Últimos movimientos**")
-        _mq = urlencode({"select": "creado_en,email,tipo,delta,detalle", "order": "creado_en.desc", "limit": "40"})
-        _mov = _tana_history_request("leda_movimientos?" + _mq)
+        st.markdown("**Últimos movimientos**" if LEDA_ES_ADMIN else "**Tus últimas recargas**")
+        _mfiltro = {"select": "creado_en,email,tipo,delta,detalle", "order": "creado_en.desc", "limit": "40"}
+        if not LEDA_ES_ADMIN:
+            _mfiltro["tipo"] = "eq.recarga"
+            _mfiltro["detalle"] = "like.*" + TANA_AUTH_EMAIL.strip().lower() + "*"
+        _mov = _tana_history_request("leda_movimientos?" + urlencode(_mfiltro))
         if isinstance(_mov, list) and _mov:
             _lima = _dt.timezone(_dt.timedelta(hours=-5))
             _filas = []
@@ -7048,8 +7066,9 @@ if LEDA_CREDITOS_ACTIVOS and LEDA_ES_ADMIN:
         else:
             st.caption("Todavía no hay movimientos. Si acabas de activar los créditos, ejecuta primero leda_creditos.sql en Supabase.")
 
-        st.markdown("**Cuentas**")
-        _cq = urlencode({"select": "email,creditos_gratis,creditos,vence,actualizado_en", "order": "actualizado_en.desc", "limit": "100"})
-        _cuentas = _tana_history_request("leda_cuentas?" + _cq)
-        if isinstance(_cuentas, list) and _cuentas:
-            st.dataframe(_cuentas, use_container_width=True)
+        if LEDA_ES_ADMIN:
+            st.markdown("**Cuentas**")
+            _cq = urlencode({"select": "email,creditos_gratis,creditos,vence,actualizado_en", "order": "actualizado_en.desc", "limit": "100"})
+            _cuentas = _tana_history_request("leda_cuentas?" + _cq)
+            if isinstance(_cuentas, list) and _cuentas:
+                st.dataframe(_cuentas, use_container_width=True)
