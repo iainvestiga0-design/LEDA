@@ -721,6 +721,32 @@ def _tana_history_update(item_id, monografia_json):
                                  payload={"monografia_json": monografia_json})
 
 
+def _leda_guardar_resultado(resolved):
+    """Guarda el resultado de la IA junto a la monografía del historial, para poder reabrirla
+    sin volver a llamar a Gemini (más rápido, sin costo y sin depender de la cuota)."""
+    try:
+        if not isinstance(resolved, dict) or not isinstance(resolved.get("asientos"), list):
+            return
+        titulo = str(st.session_state.get("monografia_nombre") or "").strip()
+        items = st.session_state.get("tana_historial_items") or []
+        item = next((i for i in items if str(i.get("title") or "") == titulo), None)
+        if not item:
+            return
+        previo = item.get("monografia_json")
+        if not isinstance(previo, dict) or previo.get("tipo") == "excel_revision" or previo.get("_leda_resultado"):
+            return
+        limpio = json.loads(json.dumps(resolved, default=str, ensure_ascii=False))
+        if len(json.dumps(limpio, ensure_ascii=False)) > 1_500_000:
+            return
+        nuevo = dict(previo)
+        nuevo["_leda_resultado"] = limpio
+        item["monografia_json"] = nuevo
+        if not _tana_history_is_local(item):
+            _tana_history_update(item.get("id"), nuevo)
+    except Exception:
+        pass
+
+
 def _excel_estado_historial(nombre, chat_log, resultado=None, asientos_tana=None):
     """Estado de una revisión de Excel para guardarlo en el historial (JSON seguro)."""
     estado = {"tipo": "excel_revision", "archivo": str(nombre), "tiene_excel": True, "chat": list(chat_log or [])[-30:]}
@@ -858,7 +884,14 @@ def _tana_open_history(item):
     ):
         st.session_state.pop(key, None)
 
+    _res_guardado = data.get("_leda_resultado") if isinstance(data, dict) else None
+    if isinstance(data, dict) and "_leda_resultado" in data:
+        data = {k: v for k, v in data.items() if k != "_leda_resultado"}
     st.session_state["monografia_json"] = data
+    if isinstance(_res_guardado, dict):
+        st.session_state["leda_resolved_cache"] = _res_guardado
+    else:
+        st.session_state.pop("leda_resolved_cache", None)
     st.session_state["monografia_nombre"] = title
     # El texto se genera más abajo (extraction_to_text aún no existe en este punto del archivo).
     st.session_state.pop("monografia_texto", None)
@@ -937,9 +970,9 @@ SUPPORTED_TYPES = ["pdf", "doc", "docx", "xls", "xlsx", "jpg", "jpeg", "png"]
 # cuando se agota la cuota de un modelo/proyecto. La primera opción conserva
 # el comportamiento actual; las siguientes se usan solo si hay 429/cuota o
 # si el modelo configurado no está disponible.
-GEMINI_MODEL = st.secrets.get("TANA_GEMINI_MODEL", os.getenv("TANA_GEMINI_MODEL", "gemini-3.5-flash"))
+GEMINI_MODEL = st.secrets.get("TANA_GEMINI_MODEL", os.getenv("TANA_GEMINI_MODEL", "gemini-3.6-flash"))
 GEMINI_MODEL_2 = st.secrets.get("TANA_GEMINI_MODEL_2", os.getenv("TANA_GEMINI_MODEL_2", "gemini-3.5-flash-lite"))
-GEMINI_MODEL_3 = st.secrets.get("TANA_GEMINI_MODEL_3", os.getenv("TANA_GEMINI_MODEL_3", "gemini-2.5-flash"))
+GEMINI_MODEL_3 = st.secrets.get("TANA_GEMINI_MODEL_3", os.getenv("TANA_GEMINI_MODEL_3", "gemini-3.8-flash"))
 
 # Cargar el PCGE antes del motor de resolución, incluso antes de generar el Excel.
 PCGE_PATHS = [
@@ -1161,28 +1194,41 @@ def _is_gemini_fallback_error(exc):
     low = str(exc).lower()
     return any(token in low for token in (
         "429", "503", "resource_exhausted", "quota", "rate limit",
-        "unavailable", "high demand", "overloaded",
-        "not found", "model not found", "unsupported model",
+        "unavailable", "high demand", "overloaded", "deadline",
+        "not found", "not_found", "model not found", "unsupported model",
+        "no longer available", "deprecated", "decommission",
     ))
 
 def _fallback_error_message(errors):
     if not errors:
         return "No hay una configuración de Gemini disponible."
     details = []
+    cuota = saturado = False
     for label, model, exc in errors:
         low = str(exc).lower()
         if "429" in low or "resource_exhausted" in low or "quota" in low:
             details.append(f"{label} ({model}): cuota agotada")
-        elif "not found" in low or "unsupported model" in low:
+            cuota = True
+        elif ("not_found" in low or "not found" in low or "no longer available" in low
+              or "unsupported model" in low or "deprecated" in low):
             details.append(f"{label} ({model}): modelo no disponible")
+        elif "503" in low or "unavailable" in low or "high demand" in low or "overloaded" in low:
+            details.append(f"{label} ({model}): saturado")
+            saturado = True
         else:
             details.append(f"{label} ({model}): {str(exc)[:180]}")
-    return (
-        "LEDA intentó las rutas disponibles de Gemini y ninguna pudo procesar "
-        "la solicitud. Revisiones realizadas: " + "; ".join(details) + ". "
-        "Puedes configurar GEMINI_API_KEY_2/GEMINI_API_KEY_3 y sus modelos "
-        "alternativos en Streamlit Secrets."
-    )
+    if cuota:
+        base = "La inteligencia artificial alcanzó su límite de uso por ahora. Intenta de nuevo en unos minutos."
+    elif saturado:
+        base = "La inteligencia artificial está saturada en este momento. Intenta de nuevo en unos minutos."
+    else:
+        base = "LEDA no pudo comunicarse con la inteligencia artificial en este momento. Intenta de nuevo en unos minutos."
+    if globals().get("LEDA_CREDITOS_ACTIVOS") and not globals().get("LEDA_ES_ADMIN"):
+        base += " No se descontó ningún crédito."
+    if globals().get("LEDA_ES_ADMIN"):
+        base += (" [Solo administrador] Detalle: " + "; ".join(details)
+                 + ". Revisa los modelos en Secrets (TANA_GEMINI_MODEL, _2, _3) y la cuota o facturación de tu clave de Gemini.")
+    return base
 
 
 def _generate_with_fallback(contents_factory, config):
@@ -3214,6 +3260,60 @@ with st.sidebar:
         st.markdown('<div style="font-weight:800;font-size:19px;color:#12304A;padding-top:6px;">LEDA</div>',
                      unsafe_allow_html=True)
 
+    if LEDA_CREDITOS_ACTIVOS:
+        if LEDA_ES_ADMIN:
+            st.markdown(
+                "<div style='background:#EAF3FF;border:1px solid #BFD8F5;border-radius:10px;padding:6px 10px;margin:6px 0 4px 0;"
+                "font-size:12.5px;font-weight:700;color:#12304A;'>👑 Administrador · uso sin límite</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            _est_sb = _leda_estado()
+            if _est_sb:
+                _disp = int(_est_sb.get("disponibles") or 0)
+                if _disp > 0:
+                    _fondo, _borde, _num = "#EAF3FF", "#BFD8F5", "#12304A"
+                else:
+                    _fondo, _borde, _num = "#FEF3F2", "#FECDCA", "#B42318"
+                _wa_u = _leda_wa_url()
+                _pill = ""
+                if _wa_u:
+                    _pill = (
+                        "<a href='" + _wa_u + "' target='_blank' rel='noopener noreferrer' "
+                        "style='background:#25D366;color:#ffffff;font-weight:800;font-size:12px;border-radius:999px;"
+                        "padding:6px 12px;text-decoration:none;white-space:nowrap;'>💬 "
+                        + ("Comprar" if _disp <= 0 else "Recargar") + "</a>"
+                    )
+                _det = []
+                if int(_est_sb.get("gratis") or 0) > 0:
+                    _det.append(str(_est_sb.get("gratis")) + " gratis")
+                if int(_est_sb.get("vigentes") or 0) > 0:
+                    _det.append(str(_est_sb.get("vigentes")) + " hasta el " + _leda_fecha(_est_sb.get("vence")))
+                _det.append("hoy " + str(_est_sb.get("usos_hoy") or 0) + "/" + str(LEDA_TOPE_DIARIO))
+                st.markdown(
+                    "<div style='display:flex;align-items:center;justify-content:space-between;gap:8px;"
+                    "background:" + _fondo + ";border:1px solid " + _borde + ";border-radius:12px;padding:7px 10px;margin:6px 0 2px 0;'>"
+                    "<div style='line-height:1.15;'>"
+                    "<div style='font-size:10.5px;font-weight:700;color:#5B7389;text-transform:uppercase;letter-spacing:.05em;'>🎟️ Créditos</div>"
+                    "<div style='font-size:22px;font-weight:800;color:" + _num + ";'>" + str(_disp) + "</div></div>"
+                    + _pill + "</div>"
+                    "<div style='font-size:11.5px;color:#5B6B78;margin:0 2px 6px 2px;'>" + " · ".join(_det) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                if _disp <= 0:
+                    _precio_txt = _leda_cfg("LEDA_PRECIO_TEXTO")
+                    if _precio_txt:
+                        st.markdown(
+                            "<div style='font-size:11.5px;color:#334452;margin:0 2px 6px 2px;'>" + _precio_txt + "</div>",
+                            unsafe_allow_html=True,
+                        )
+            if LEDA_ES_VENDEDOR:
+                st.markdown(
+                    "<div style='background:#F1F5F9;border:1px solid #D6DEE6;border-radius:10px;padding:5px 10px;margin:2px 0 6px 0;"
+                    "font-size:11.5px;color:#334452;'>🛒 <b>Vendedor</b> · panel de ventas al final de la página</div>",
+                    unsafe_allow_html=True,
+                )
+
     if st.button("➕  Nuevo chat", use_container_width=True):
         for _key in (
             "monografia_json", "monografia_texto", "monografia_nombre", "tana_file_signature",
@@ -3249,58 +3349,6 @@ with st.sidebar:
             _tana_retry_history_sync()
             st.rerun()
 
-    if LEDA_CREDITOS_ACTIVOS:
-        _tarjeta_css = "border-radius:14px;padding:12px 14px;margin:12px 0 4px 0;"
-        if LEDA_ES_ADMIN:
-            st.markdown(
-                "<div style='background:#EAF3FF;border:1px solid #BFD8F5;" + _tarjeta_css + "'>"
-                "<div style='font-size:15px;font-weight:800;color:#12304A;'>👑 Administrador</div>"
-                "<div style='font-size:13px;color:#334452;margin-top:2px;'>Uso sin límite de créditos</div>"
-                "</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            _est_sb = _leda_estado()
-            if _est_sb:
-                _disp = int(_est_sb.get("disponibles") or 0)
-                _det = []
-                if int(_est_sb.get("gratis") or 0) > 0:
-                    _det.append(str(_est_sb.get("gratis")) + " gratis")
-                if int(_est_sb.get("vigentes") or 0) > 0:
-                    _det.append(str(_est_sb.get("vigentes")) + " hasta el " + _leda_fecha(_est_sb.get("vence")))
-                _precio_txt = _leda_cfg("LEDA_PRECIO_TEXTO")
-                if _disp > 0:
-                    _fondo, _borde, _num = "#EAF3FF", "#BFD8F5", "#12304A"
-                    _linea2 = " · ".join(_det)
-                else:
-                    _fondo, _borde, _num = "#FEF3F2", "#FECDCA", "#B42318"
-                    _linea2 = "Recarga para seguir resolviendo"
-                st.markdown(
-                    "<div style='background:" + _fondo + ";border:1px solid " + _borde + ";" + _tarjeta_css + "'>"
-                    "<div style='font-size:12px;font-weight:700;color:#5B7389;text-transform:uppercase;letter-spacing:.05em;'>🎟️ Tus créditos</div>"
-                    "<div style='font-size:34px;font-weight:800;color:" + _num + ";line-height:1.1;margin:2px 0;'>" + str(_disp) + "</div>"
-                    "<div style='font-size:13px;color:#334452;'>" + _linea2 + "</div>"
-                    "<div style='font-size:12px;color:#6B7B87;margin-top:6px;'>Hoy: "
-                    + str(_est_sb.get("usos_hoy") or 0) + " de " + str(LEDA_TOPE_DIARIO) + " trabajos</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
-                _btn_wa = _leda_boton_wa("💬 Comprar créditos" if _disp <= 0 else "💬 Recargar por WhatsApp")
-                if _btn_wa:
-                    if _precio_txt:
-                        st.markdown(
-                            "<div style='font-size:12.5px;color:#334452;margin:6px 2px 0 2px;'>" + _precio_txt + "</div>",
-                            unsafe_allow_html=True,
-                        )
-                    st.markdown(_btn_wa, unsafe_allow_html=True)
-            if LEDA_ES_VENDEDOR:
-                st.markdown(
-                    "<div style='background:#F1F5F9;border:1px solid #D6DEE6;" + _tarjeta_css + "'>"
-                    "<div style='font-size:14px;font-weight:800;color:#12304A;'>🛒 Vendedor</div>"
-                    "<div style='font-size:12.5px;color:#334452;margin-top:2px;'>Tu panel de ventas está al final de la página.</div>"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
     st.markdown(
         '<div class="tana-side-account">'
         '<div class="tana-avatar">C</div><span>' + TANA_AUTH_EMAIL.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + '</span></div>',
@@ -4918,6 +4966,10 @@ def sincronizar_costo_ventas_con_kardex(asientos, kardex):
 
 
 def resolve_asientos_with_gemini():
+    _cache = st.session_state.pop("leda_resolved_cache", None)
+    if isinstance(_cache, dict) and isinstance(_cache.get("asientos"), list):
+        # Resultado ya guardado en el historial: no se llama a Gemini.
+        return _cache, {str(cod).strip(): str(desc) for cod, desc in PCGE_DATA}
     if not get_gemini_profiles():
         raise RuntimeError("No está configurada ninguna GEMINI_API_KEY en Streamlit Secrets.")
 
@@ -4958,7 +5010,8 @@ def resolve_asientos_with_gemini():
 
 if "monografia_json" in st.session_state and "asientos_contables" not in st.session_state:
     _nuevo_trabajo = bool(st.session_state.get("leda_cobro_pendiente")) and st.session_state.get("leda_cobro_pendiente") == st.session_state.get("monografia_nombre")
-    if not _nuevo_trabajo and st.session_state.get("leda_reapertura_ok") != st.session_state.get("monografia_nombre"):
+    if (not _nuevo_trabajo and not st.session_state.get("leda_resolved_cache")
+            and st.session_state.get("leda_reapertura_ok") != st.session_state.get("monografia_nombre")):
         _ok_re, _msg_re = _leda_gate_reapertura(str(st.session_state.get("monografia_nombre", "")))
         if not _ok_re:
             st.warning(_msg_re)
@@ -5025,6 +5078,8 @@ if "monografia_json" in st.session_state and "asientos_contables" not in st.sess
             st.session_state["registro_ventas"] = registro_ventas
             st.session_state["kardex"] = kardex
             st.session_state["costos"] = costos
+            if not errors:
+                _leda_guardar_resultado(resolved)
             _leda_pend = st.session_state.pop("leda_cobro_pendiente", None)
             if _leda_pend and _leda_pend == st.session_state.get("monografia_nombre"):
                 _leda_cobro_final(_leda_pend, bool(errors))
