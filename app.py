@@ -3213,23 +3213,48 @@ with st.sidebar:
             st.rerun()
 
     if LEDA_CREDITOS_ACTIVOS:
+        _tarjeta_css = "border-radius:14px;padding:12px 14px;margin:12px 0 4px 0;"
         if LEDA_ES_ADMIN:
-            st.caption("👑 Administrador · uso sin límite")
+            st.markdown(
+                "<div style='background:#EAF3FF;border:1px solid #BFD8F5;" + _tarjeta_css + "'>"
+                "<div style='font-size:15px;font-weight:800;color:#12304A;'>👑 Administrador</div>"
+                "<div style='font-size:13px;color:#334452;margin-top:2px;'>Uso sin límite de créditos</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            if LEDA_ES_VENDEDOR:
-                st.caption("🛒 Vendedor · el panel de ventas está al final de la página")
             _est_sb = _leda_estado()
             if _est_sb:
                 _disp = int(_est_sb.get("disponibles") or 0)
-                st.markdown("🎟️ **Créditos disponibles: " + str(_disp) + "**")
                 _det = []
                 if int(_est_sb.get("gratis") or 0) > 0:
                     _det.append(str(_est_sb.get("gratis")) + " gratis")
                 if int(_est_sb.get("vigentes") or 0) > 0:
                     _det.append(str(_est_sb.get("vigentes")) + " hasta el " + _leda_fecha(_est_sb.get("vence")))
-                if _det:
-                    st.caption(" · ".join(_det))
-                st.caption("Hoy: " + str(_est_sb.get("usos_hoy") or 0) + " de " + str(LEDA_TOPE_DIARIO) + " trabajos")
+                if _disp > 0:
+                    _fondo, _borde, _num = "#EAF3FF", "#BFD8F5", "#12304A"
+                    _linea2 = " · ".join(_det)
+                else:
+                    _fondo, _borde, _num = "#FEF3F2", "#FECDCA", "#B42318"
+                    _linea2 = "Recarga para seguir resolviendo"
+                st.markdown(
+                    "<div style='background:" + _fondo + ";border:1px solid " + _borde + ";" + _tarjeta_css + "'>"
+                    "<div style='font-size:12px;font-weight:700;color:#5B7389;text-transform:uppercase;letter-spacing:.05em;'>🎟️ Tus créditos</div>"
+                    "<div style='font-size:34px;font-weight:800;color:" + _num + ";line-height:1.1;margin:2px 0;'>" + str(_disp) + "</div>"
+                    "<div style='font-size:13px;color:#334452;'>" + _linea2 + "</div>"
+                    "<div style='font-size:12px;color:#6B7B87;margin-top:6px;'>Hoy: "
+                    + str(_est_sb.get("usos_hoy") or 0) + " de " + str(LEDA_TOPE_DIARIO) + " trabajos</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            if LEDA_ES_VENDEDOR:
+                st.markdown(
+                    "<div style='background:#F1F5F9;border:1px solid #D6DEE6;" + _tarjeta_css + "'>"
+                    "<div style='font-size:14px;font-weight:800;color:#12304A;'>🛒 Vendedor</div>"
+                    "<div style='font-size:12.5px;color:#334452;margin-top:2px;'>Tu panel de ventas está al final de la página.</div>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
     st.markdown(
         '<div class="tana-side-account">'
         '<div class="tana-avatar">C</div><span>' + TANA_AUTH_EMAIL.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + '</span></div>',
