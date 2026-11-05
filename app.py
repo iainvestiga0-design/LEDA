@@ -3030,6 +3030,40 @@ def _leda_fecha(valor):
         return str(valor or "")
 
 
+def _leda_wa_url():
+    """Enlace de WhatsApp para comprar créditos. Con varios vendedores, cada cuenta se asigna a uno de forma estable."""
+    try:
+        _nums = []
+        for _n in _leda_cfg("LEDA_WHATSAPP").replace(";", ",").split(","):
+            _d = re.sub(r"\D", "", _n)
+            if len(_d) == 9:
+                _d = "51" + _d          # número peruano sin código de país
+            if len(_d) >= 10:
+                _nums.append(_d)
+        if not _nums:
+            return ""
+        _num = _nums[sum(ord(_c) for _c in TANA_AUTH_EMAIL) % len(_nums)]
+        _txt = _leda_cfg(
+            "LEDA_WHATSAPP_MENSAJE",
+            "Hola, quiero comprar créditos de LEDA. Mi correo registrado es: {email}",
+        ).replace("{email}", TANA_AUTH_EMAIL)
+        return "https://wa.me/" + _num + "?text=" + quote(_txt)
+    except Exception:
+        return ""
+
+
+def _leda_boton_wa(texto="💬 Comprar créditos por WhatsApp"):
+    _u = _leda_wa_url()
+    if not _u:
+        return ""
+    return (
+        "<a href='" + _u + "' target='_blank' rel='noopener noreferrer' "
+        "style='display:block;text-align:center;background:#25D366;color:#ffffff;font-weight:800;"
+        "font-size:14px;border-radius:12px;padding:11px 10px;text-decoration:none;margin:8px 0 4px 0;'>"
+        + texto + "</a>"
+    )
+
+
 def _leda_rpc(nombre, payload):
     """Llama a una función SQL de Supabase. Devuelve dict o None si falló."""
     _previo = st.session_state.get("tana_history_last_error")
@@ -3079,6 +3113,9 @@ def _leda_mensaje_bloqueo(est):
         return ("Alcanzaste el límite de " + str(LEDA_TOPE_DIARIO)
                 + " trabajos por hoy. Vuelve mañana para seguir.")
     _pago = LEDA_PAGO_TEXTO.replace("{email}", TANA_AUTH_EMAIL)
+    _wa = _leda_wa_url()
+    if _wa:
+        _pago = _pago + "  \n\n👉 [💬 Comprar créditos por WhatsApp](" + _wa + ")"
     if _motivo == "vencidos":
         return ("Tus créditos vencieron el " + _leda_fecha((est or {}).get("vence")) + ". " + _pago)
     return "Te quedaste sin créditos. " + _pago
@@ -3231,6 +3268,7 @@ with st.sidebar:
                     _det.append(str(_est_sb.get("gratis")) + " gratis")
                 if int(_est_sb.get("vigentes") or 0) > 0:
                     _det.append(str(_est_sb.get("vigentes")) + " hasta el " + _leda_fecha(_est_sb.get("vence")))
+                _precio_txt = _leda_cfg("LEDA_PRECIO_TEXTO")
                 if _disp > 0:
                     _fondo, _borde, _num = "#EAF3FF", "#BFD8F5", "#12304A"
                     _linea2 = " · ".join(_det)
@@ -3247,6 +3285,14 @@ with st.sidebar:
                     "</div>",
                     unsafe_allow_html=True,
                 )
+                _btn_wa = _leda_boton_wa("💬 Comprar créditos" if _disp <= 0 else "💬 Recargar por WhatsApp")
+                if _btn_wa:
+                    if _precio_txt:
+                        st.markdown(
+                            "<div style='font-size:12.5px;color:#334452;margin:6px 2px 0 2px;'>" + _precio_txt + "</div>",
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown(_btn_wa, unsafe_allow_html=True)
             if LEDA_ES_VENDEDOR:
                 st.markdown(
                     "<div style='background:#F1F5F9;border:1px solid #D6DEE6;" + _tarjeta_css + "'>"
