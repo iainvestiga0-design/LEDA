@@ -5218,6 +5218,15 @@ def resolve_asientos_with_gemini(feedback=None):
         types.GenerateContentConfig(response_mime_type="application/json"),
     )
     data = json.loads(response.text or "{}")
+    # A veces Gemini devuelve directamente la lista de asientos (o una lista con un solo objeto):
+    # se normaliza a la estructura {"asientos": [...]} que espera LEDA.
+    if isinstance(data, list):
+        if len(data) == 1 and isinstance(data[0], dict) and "asientos" in data[0]:
+            data = data[0]
+        else:
+            data = {"asientos": data}
+    if not isinstance(data, dict):
+        raise ValueError("La respuesta de la inteligencia artificial no tiene el formato esperado.")
     data.setdefault("_tana_gemini_route", profile["label"])
     data.setdefault("_tana_gemini_model", profile["model"])
     return data, pcge_map
