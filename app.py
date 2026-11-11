@@ -2459,6 +2459,41 @@ def _gemini_error_message(exc):
     return msg
 
 
+def _leda_texto_word(ruta, sufijo):
+    """Texto completo de un Word (párrafos y tablas, en orden) para no depender de que Gemini
+    interprete el archivo binario. Devuelve "" si no se puede (entonces se sube el archivo)."""
+    try:
+        if sufijo == ".docx":
+            from docx.table import Table
+            from docx.text.paragraph import Paragraph
+            doc = Document(ruta)
+            partes = []
+            for hijo in doc.element.body.iterchildren():
+                tag = hijo.tag.rsplit("}", 1)[-1]
+                if tag == "p":
+                    t = Paragraph(hijo, doc).text.strip()
+                    if t:
+                        partes.append(t)
+                elif tag == "tbl":
+                    for fila in Table(hijo, doc).rows:
+                        celdas, vistos = [], []
+                        for c in fila.cells:
+                            if any(c._tc is v for v in vistos):
+                                continue            # celda combinada: se cuenta una sola vez
+                            vistos.append(c._tc)
+                            celdas.append(c.text.strip().replace("\n", " "))
+                        if any(celdas):
+                            partes.append(" | ".join(celdas))
+            return "\n".join(partes)
+        if sufijo == ".doc" and shutil.which("antiword"):
+            r = subprocess.run(["antiword", "-w", "0", ruta], capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    return ""
+
+
 def extract_with_gemini(uploaded):
     profiles = get_gemini_profiles()
     if not profiles:
@@ -2478,16 +2513,27 @@ def extract_with_gemini(uploaded):
             temp_path = tmp.name
 
         errors = []
+        texto_local = _leda_texto_word(temp_path, suffix)
+        if len(texto_local.strip()) < 400:
+            texto_local = ""                       # muy corto (p. ej. el Word son imágenes): se sube el archivo
         for profile in profiles:
             client = get_gemini_client(profile["api_key"])
             gemini_file = None
             try:
-                # Cada perfil tiene su propio cliente/proyecto. El archivo se sube
-                # a ese proyecto y solo entonces se consume la generación.
-                gemini_file = client.files.upload(file=temp_path)
+                # Si se pudo leer el Word localmente, se envía el texto (más exacto y más barato).
+                # Si no, cada perfil sube el archivo a su propio proyecto.
+                if texto_local:
+                    contenido = [
+                        "CONTENIDO DE LA MONOGRAFÍA (texto extraído del archivo Word; en las tablas, "
+                        "las columnas van separadas por |):\n" + texto_local,
+                        EXTRACTION_PROMPT,
+                    ]
+                else:
+                    gemini_file = client.files.upload(file=temp_path)
+                    contenido = [gemini_file, EXTRACTION_PROMPT]
                 response = client.models.generate_content(
                     model=profile["model"],
-                    contents=[gemini_file, EXTRACTION_PROMPT],
+                    contents=contenido,
                     config=types.GenerateContentConfig(response_mime_type="application/json"),
                 )
                 raw = response.text or ""
@@ -3944,6 +3990,27 @@ REGLA CRÍTICA SOBRE CUENTAS DE DESTINO (79):
 - El asiento de destino normalmente es: cuenta del Elemento 9 en el DEBE y 79111 en el HABER.
 - No confundas la cuenta 79 con la cuenta 70 ni con la cuenta 69. La 79 es una cuenta puente de destino y debe quedar fuera de los estados de resultados.
 
+REGLAS DE EXACTITUD (OBLIGATORIAS):
+- Antes de responder, verifica CADA asiento: total Debe = total Haber. Nunca entregues un asiento descuadrado.
+- En el campo "concepto" de toda línea cuyo importe provenga de un cálculo (cantidad por precio, porcentajes,
+  IGV, descuentos, prorrateos, depreciaciones), escribe el cálculo entre paréntesis usando solo números y los
+  operadores + - * / (ejemplos: "(5000*75 + 6800*88)", "(973400*0.18)"). El resultado de esa expresión debe ser
+  EXACTAMENTE el importe de la línea. Usa punto decimal y no uses separadores de miles dentro del cálculo.
+- Los porcentajes de aporte o de pago de un socio se aplican sobre el valor que corresponde a ese socio, no
+  sobre el capital total de la empresa, salvo que la monografía indique otra base.
+- Si el enunciado no aclara si un importe incluye IGV, trátalo como valor base (sin IGV) y agrega el IGV del 18%.
+  Si dice "incluido IGV" o "incluye IGV", la base es el importe dividido entre 1.18.
+- COMPRAS de existencias (mercaderías, materias primas, suministros, envases): SIEMPRE en DOS asientos:
+  (1) la compra: Debe 60xxx (subcuenta de la existencia) por la base y Debe IGV / Haber caja, bancos o
+  cuentas por pagar por el total; (2) el ingreso al almacén: Debe 20xxx (o la cuenta de existencias que
+  corresponda) / Haber 61xxx por el mismo valor base. Nunca cargues la 20 directamente contra caja, bancos
+  o cuentas por pagar.
+- VENTAS de mercaderías: en DOS asientos: (1) Debe 10 o 12 / Haber IGV y 70xxx; (2) el costo de ventas:
+  Debe 69xxx / Haber 20xxx.
+- Cada operación de la monografía debe tener su asiento, con "operacion_numero" igual al número de la operación.
+- En el asiento de destino (cuenta del Elemento 9 contra 79111), completa el campo "cuentas_destinadas" con los
+  códigos de las cuentas de gasto del Elemento 6 que estás destinando (por ejemplo ["65611"]).
+
 ANEXOS ADICIONALES (Registro de Compras, Registro de Ventas, Kardex):
 LEDA solo genera estos tres anexos cuando la monografía los pide explícitamente.
 Estos indicadores ya fueron calculados a partir de "solicitudes" y "datos_importantes":
@@ -3995,6 +4062,7 @@ Devuelve SOLO JSON válido con esta estructura:
       "operacion_numero": 1,
       "requiere_revision": false,
       "observacion": "",
+      "cuentas_destinadas": [],
       "lineas": [
         {
           "codigo": "12345",
@@ -4144,6 +4212,147 @@ def _money(value):
     except (InvalidOperation, ValueError):
         return None
 
+
+import ast as _ast
+
+def _leda_eval_expr(texto):
+    """Evalúa de forma segura una expresión aritmética simple (+ - * /). Devuelve float o None."""
+    try:
+        arbol = _ast.parse(texto, mode="eval")
+    except Exception:
+        return None
+
+    def _ev(n):
+        if isinstance(n, _ast.Expression):
+            return _ev(n.body)
+        if isinstance(n, _ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool):
+            return float(n.value)
+        if isinstance(n, _ast.UnaryOp) and isinstance(n.op, (_ast.UAdd, _ast.USub)):
+            v = _ev(n.operand)
+            return v if isinstance(n.op, _ast.UAdd) else -v
+        if isinstance(n, _ast.BinOp) and isinstance(n.op, (_ast.Add, _ast.Sub, _ast.Mult, _ast.Div)):
+            a, b = _ev(n.left), _ev(n.right)
+            if isinstance(n.op, _ast.Add):
+                return a + b
+            if isinstance(n.op, _ast.Sub):
+                return a - b
+            if isinstance(n.op, _ast.Mult):
+                return a * b
+            return a / b
+        raise ValueError("expresión no permitida")
+
+    try:
+        return _ev(arbol)
+    except Exception:
+        return None
+
+
+_LEDA_RE_EXPR = re.compile(r"[(\d][\d.,\s+\-*/()×x]*")
+
+
+def _leda_expresiones(concepto):
+    """Extrae del concepto los cálculos aritméticos (con * o +) y devuelve [(texto, valor)]."""
+    salida = []
+    texto = str(concepto or "")
+    for m in _LEDA_RE_EXPR.finditer(texto):
+        t = m.group(0).strip()
+        if texto[m.end():m.end() + 2].strip().startswith("%"):
+            continue                       # el cálculo sigue con un porcentaje: no se puede evaluar solo
+        t = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", t)      # 1,200 -> 1200
+        if "," in t:
+            continue
+        t = re.sub(r"(?<=\d)\s*[x×]\s*(?=[\d(])", "*", t)
+        t = t.rstrip("x×").strip()
+        if not re.search(r"[*+]", t):
+            continue                       # fechas, rangos o números sueltos: no son cálculos
+        if re.search(r"(?<![\d.])0\d", t):
+            continue                       # números con ceros a la izquierda: no son importes
+        while t.count(")") > t.count("(") and t.endswith(")"):
+            t = t[:-1].rstrip()
+        while t.count("(") > t.count(")") and t.startswith("("):
+            t = t[1:].lstrip()
+        valor = _leda_eval_expr(t)
+        if valor is not None:
+            salida.append((t, valor))
+    return salida
+
+
+def _leda_chequeos_extra(asientos):
+    """Errores y avisos adicionales: cálculo vs importe, compras directas a 20 y operaciones sin asiento."""
+    errores, avisos = [], []
+    for a_idx, asiento in enumerate(asientos or [], start=1):
+        if not isinstance(asiento, dict):
+            continue
+        num = asiento.get("numero", a_idx)
+        lineas = [l for l in (asiento.get("lineas") or []) if isinstance(l, dict)]
+        # 1) El cálculo escrito en el concepto debe dar exactamente el importe de la línea
+        for l_idx, l in enumerate(lineas, start=1):
+            debe = _to_float(l.get("debe"), 0.0) or 0.0
+            haber = _to_float(l.get("haber"), 0.0) or 0.0
+            importe = debe if debe > 0 else haber
+            exprs = _leda_expresiones(l.get("concepto"))
+            if importe > 0 and exprs and not any(abs(v - importe) <= 0.05 for _, v in exprs) \
+                    and abs(sum(v for _, v in exprs) - importe) > 0.05:
+                t, v = exprs[0]
+                errores.append(
+                    f"Asiento {num}, línea {l_idx}: el importe {importe:,.2f} no coincide con su cálculo ({t} = {v:,.2f})."
+                )
+        # 2) Compra de mercaderías cargada directo a la 20 (debe ir 60 y luego 20/61)
+        codigos = [str(l.get("codigo", "")).strip() for l in lineas]
+        es_apertura = any(c[:2] in {"50", "51", "52", "56", "57", "58", "59"} for c in codigos)
+        carga_20 = any(str(l.get("codigo", "")).strip()[:2] == "20" and (_to_float(l.get("debe"), 0.0) or 0.0) > 0 for l in lineas)
+        abono_pago = any(
+            str(l.get("codigo", "")).strip()[:2] in {"10", "12", "40", "42", "45", "46"}
+            and (_to_float(l.get("haber"), 0.0) or 0.0) > 0 for l in lineas
+        )
+        if carga_20 and abono_pago and not es_apertura and not any(c[:2] in {"61", "69", "71"} for c in codigos):
+            errores.append(
+                f"Asiento {num}: la compra de mercaderías no puede cargarse directo a la cuenta 20. "
+                "Registra primero la compra (60 + IGV contra caja, bancos o cuentas por pagar) y luego el "
+                "ingreso al almacén en otro asiento (20 contra 61)."
+            )
+    # 3) Operaciones de la monografía sin ningún asiento (solo aviso)
+    try:
+        ops = (st.session_state.get("monografia_json") or {}).get("operaciones") or []
+        con_asiento = set()
+        for a in asientos or []:
+            try:
+                con_asiento.add(int(float(str(a.get("operacion_numero", "")).strip())))
+            except Exception:
+                pass
+        numeros = {}
+        for op in ops:
+            try:
+                n = int(float(str(op.get("numero"))))
+            except Exception:
+                continue
+            texto = " ".join(str(op.get(k, "")) for k in ("descripcion", "glosa", "detalle", "texto")).lower()
+            if re.search(r"utilidad|distribu|reserva|determin|cierre", texto):
+                continue                    # se resuelven en HT / distribución, no con un asiento propio
+            numeros[n] = texto
+        if numeros and con_asiento and con_asiento <= (set(numeros) | {0}):
+            faltan = sorted(n for n in numeros if n not in con_asiento)
+            if faltan:
+                avisos.append("Operaciones de la monografía sin ningún asiento: " + ", ".join(str(n) for n in faltan[:12]) + ".")
+    except Exception:
+        pass
+    return errores, avisos
+
+
+def _leda_feedback_texto(errores, asientos):
+    """Texto de corrección que se le envía a Gemini cuando la validación encuentra errores."""
+    numeros = set(re.findall(r"Asiento (\d+)", " ".join(errores)))
+    malos = [a for a in (asientos or []) if isinstance(a, dict) and str(a.get("numero")) in numeros][:8]
+    txt = ("CORRECCIÓN OBLIGATORIA: tu respuesta anterior tuvo estos errores que debes corregir:\n- "
+           + "\n- ".join(errores[:25])
+           + "\nCorrige TODOS estos errores y devuelve la respuesta COMPLETA (todos los asientos, no solo los corregidos) "
+             "en el mismo formato JSON. Verifica que cada asiento cuadre (Debe = Haber) y que el cálculo escrito en cada "
+             "concepto dé exactamente el importe de la línea. Recalcula con cuidado cantidades por precios, porcentajes e IGV.")
+    if malos:
+        txt += "\nAsientos con error en tu respuesta anterior:\n" + json.dumps(malos, ensure_ascii=False)
+    return txt[:9000]
+
+
 def validate_asientos(data, pcge_map):
     errors = []
     warnings = []
@@ -4190,6 +4399,9 @@ def validate_asientos(data, pcge_map):
         else:
             valid.append(asiento)
 
+    _err_extra, _avisos_extra = _leda_chequeos_extra(data.get("asientos", []))
+    errors.extend(_err_extra)
+    warnings.extend(_avisos_extra)
     return valid, errors, warnings
 
 def _numeric_from_obj(obj, keys):
@@ -4965,7 +5177,7 @@ def sincronizar_costo_ventas_con_kardex(asientos, kardex):
     return resultado, alertas
 
 
-def resolve_asientos_with_gemini():
+def resolve_asientos_with_gemini(feedback=None):
     _cache = st.session_state.pop("leda_resolved_cache", None)
     if isinstance(_cache, dict) and isinstance(_cache.get("asientos"), list):
         # Resultado ya guardado en el historial: no se llama a Gemini.
@@ -4995,6 +5207,8 @@ def resolve_asientos_with_gemini():
         .replace("{incluir_kx}", "true" if incluir_kx else "false")
         .replace("{metodo_kardex}", metodo_kx)
     )
+    if feedback:
+        prompt = prompt + "\n\n" + str(feedback)
 
     def make_contents(_client):
         return [prompt]
@@ -5019,8 +5233,9 @@ if "monografia_json" in st.session_state and "asientos_contables" not in st.sess
         st.session_state["leda_reapertura_ok"] = st.session_state.get("monografia_nombre")
     with st.spinner("LEDA está desarrollando y validando los asientos contables…"):
         try:
-            for _intento in range(2):   # si la validación detecta errores, se reintenta una vez
-                resolved, pcge_map = resolve_asientos_with_gemini()
+            _fb = None
+            for _intento in range(3):   # si la validación detecta errores, se corrige hasta 2 veces con esos errores como guía
+                resolved, pcge_map = resolve_asientos_with_gemini(_fb)
                 if isinstance(resolved, dict):
                     asientos_generados = resolved.get("asientos", [])
                     alertas_gemini = resolved.get("alertas", [])
@@ -5068,8 +5283,9 @@ if "monografia_json" in st.session_state and "asientos_contables" not in st.sess
                     alertas_kardex.extend(validar_kardex(kardex))
 
                 valid, errors, warnings = validate_asientos({"asientos": asientos_generados}, pcge_map)
-                if not errors or _intento == 1:
+                if not errors or _intento == 2:
                     break
+                _fb = _leda_feedback_texto(errors, asientos_generados)
             st.session_state["asientos_contables"] = asientos_generados
             st.session_state["asientos_validos"] = valid
             st.session_state["errores_asientos"] = errors
@@ -5533,24 +5749,41 @@ def es_naturaleza(code):
 # a una cuenta de función.
 def detectar_cuentas_6_con_destino(asientos):
     con_destino = set()
-    for asiento in asientos or []:
+    candidatos = []   # cargos a cuentas 65/67 que todavía no se sabe si fueron destinados
+    for pos, asiento in enumerate(asientos or []):
         # Destino generado por LEDA: ya indica qué cuentas 6 fueron destinadas.
         if isinstance(asiento, dict):
             for _c in asiento.get("cuentas_destinadas", []) or []:
                 con_destino.add(str(_c).strip())
         lineas = asiento.get("lineas", []) if isinstance(asiento, dict) else []
-        hay_94_95 = any(
-            str(x.get("codigo", "")).strip().startswith(("94", "95"))
-            for x in lineas if isinstance(x, dict)
-        )
-        if not hay_94_95:
-            continue
+        lineas = [x for x in lineas if isinstance(x, dict)]
+        hay_94_95 = any(str(x.get("codigo", "")).strip().startswith(("94", "95")) for x in lineas)
+        if hay_94_95:
+            for x in lineas:
+                codigo = str(x.get("codigo", "")).strip()
+                if codigo[:1] == "6" and len(codigo) == 5:
+                    con_destino.add(codigo)
+            # El destino suele ir en un asiento aparte (94/95 contra 79): se empareja por importe
+            # con el gasto 65/67 de los asientos anteriores (el mismo monto, hasta 6 asientos antes).
+            for x in lineas:
+                codigo = str(x.get("codigo", "")).strip()
+                if codigo[:2] not in ("94", "95"):
+                    continue
+                monto = round(_to_float(x.get("debe"), 0.0) or 0.0, 2)
+                if monto <= 0:
+                    continue
+                for cand in reversed(candidatos):
+                    if cand[3] or pos - cand[0] > 6 or cand[1] in con_destino:
+                        continue
+                    if abs(cand[2] - monto) <= 0.01:
+                        cand[3] = True
+                        con_destino.add(cand[1])
+                        break
         for x in lineas:
-            if not isinstance(x, dict):
-                continue
             codigo = str(x.get("codigo", "")).strip()
-            if codigo[:1] == "6" and len(codigo) == 5:
-                con_destino.add(codigo)
+            debe = round(_to_float(x.get("debe"), 0.0) or 0.0, 2)
+            if codigo[:2] in ("65", "67") and len(codigo) == 5 and debe > 0:
+                candidatos.append([pos, codigo, debe, False])
     return con_destino
 
 CUENTAS_6_CON_DESTINO = detectar_cuentas_6_con_destino(
