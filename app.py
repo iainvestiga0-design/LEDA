@@ -57,6 +57,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+try:
+    _ref_q = st.query_params.get("ref")
+    if isinstance(_ref_q, (list, tuple)):
+        _ref_q = _ref_q[0] if _ref_q else None
+    _ref_q = re.sub(r"[^A-Za-z0-9]", "", str(_ref_q or ""))[:12]
+    if _ref_q:
+        st.session_state["leda_ref"] = _ref_q.upper()
+except Exception:
+    pass
+
+
 @st.cache_data(show_spinner=False)
 def _leda_banner_uri():
     """Logo completo (banner) en base64, leído una sola vez."""
@@ -492,9 +503,12 @@ def _tana_auth_screen():
                     st.error("La contraseña debe tener al menos 6 caracteres.")
                 else:
                     try:
+                        _payload_signup = {"email": email_new.strip(), "password": password_new}
+                        if st.session_state.get("leda_ref"):
+                            _payload_signup["data"] = {"ref": st.session_state.get("leda_ref")}   # sobrevive a la verificación del correo
                         data = _tana_supabase_request(
                             "/auth/v1/signup?redirect_to=" + quote(_tana_app_url() + "/?verificado=1", safe=""),
-                            payload={"email": email_new.strip(), "password": password_new},
+                            payload=_payload_signup,
                         )
                         # Según la versión de Supabase, la sesión llega anidada o en la raíz.
                         session = data.get("session") or (data if data.get("access_token") else None)
@@ -3107,6 +3121,11 @@ LEDA_VENDEDOR_MAX = _leda_cfg_int("LEDA_VENDEDOR_MAX", 20)
 LEDA_TOPE_DIARIO = _leda_cfg_int("LEDA_TOPE_DIARIO", 5)
 LEDA_TOPE_REABRIR = _leda_cfg_int("LEDA_TOPE_REABRIR", 15)
 LEDA_GRATIS = _leda_cfg_int("LEDA_CREDITOS_GRATIS", 1)
+LEDA_GRATIS_TOPE_DIA = _leda_cfg_int("LEDA_GRATIS_TOPE_DIA", 30)      # máx. de créditos de bienvenida por día (0 = sin tope)
+LEDA_DOMINIOS_BLOQUEADOS = _leda_cfg("LEDA_DOMINIOS_BLOQUEADOS")       # dominios extra sin crédito de bienvenida (separados por comas)
+LEDA_REF_MIN = _leda_cfg_int("LEDA_REF_MIN_CREDITOS", 5)               # compra mínima del invitado para premiar al invitador
+LEDA_REF_PREMIO = _leda_cfg_int("LEDA_REF_PREMIO", 1)                  # créditos que gana quien invita (0 = sin invitaciones)
+LEDA_REF_TOPE_MES = _leda_cfg_int("LEDA_REF_TOPE_MES", 5)              # máx. de premios por invitador al mes
 LEDA_VENCE_DEFAULT = _leda_cfg("LEDA_VENCE_DEFAULT", "2026-12-31")
 LEDA_PAGO_TEXTO = _leda_cfg(
     "LEDA_PAGO_TEXTO",
@@ -3181,6 +3200,16 @@ def _leda_uid():
     return _tana_history_user_id()
 
 
+def _leda_ref_actual():
+    """Código de invitación de esta persona: el de su registro (guardado en su cuenta) o el del enlace actual."""
+    try:
+        _meta = TANA_AUTH_USER.get("user_metadata") or {}
+        _r = str(_meta.get("ref") or st.session_state.get("leda_ref") or "")
+        return re.sub(r"[^A-Za-z0-9]", "", _r)[:12].upper()
+    except Exception:
+        return ""
+
+
 def _leda_estado(force=False):
     """Estado de la cuenta; crea la cuenta (con el crédito de bienvenida) la primera vez."""
     if not LEDA_CREDITOS_ACTIVOS:
@@ -3194,6 +3223,9 @@ def _leda_estado(force=False):
         "p_email": TANA_AUTH_EMAIL.strip().lower(),
         "p_gratis": LEDA_GRATIS,
         "p_tope": LEDA_TOPE_DIARIO,
+        "p_ref": _leda_ref_actual() or None,
+        "p_gratis_dia": LEDA_GRATIS_TOPE_DIA,
+        "p_dominios": LEDA_DOMINIOS_BLOQUEADOS,
     })
     st.session_state["leda_estado"] = {"t": _ahora, "d": _d}
     return _d
@@ -3353,6 +3385,43 @@ with st.sidebar:
                             "<div style='font-size:11.5px;color:#334452;margin:0 2px 6px 2px;'>" + _precio_txt + "</div>",
                             unsafe_allow_html=True,
                         )
+                    _motivo_bv = {
+                        "duplicado": "Este correo ya recibió su crédito de bienvenida en otra cuenta.",
+                        "descartable": "Los correos temporales no reciben crédito de bienvenida.",
+                        "tope_dia": "Los créditos de bienvenida de hoy se agotaron. Compra o vuelve mañana.",
+                    }.get(str(_est_sb.get("bienvenida") or ""))
+                    if _motivo_bv:
+                        st.markdown(
+                            "<div style='font-size:11.5px;color:#7A4B00;background:#FFF6E0;border:1px solid #F3DDA6;"
+                            "border-radius:8px;padding:5px 8px;margin:0 0 6px 0;'>" + _motivo_bv + "</div>",
+                            unsafe_allow_html=True,
+                        )
+                _cod_inv = str(_est_sb.get("codigo") or "")
+                if _cod_inv and LEDA_REF_PREMIO > 0:
+                    import html as _html
+                    _enlace_inv = _tana_app_url() + "/?ref=" + _cod_inv
+                    _msg_inv = ("Estoy usando LEDA, el asistente contable con IA que desarrolla asientos, HT y "
+                                "estados financieros. Entra con mi enlace: " + _enlace_inv)
+                    _wa_inv = "https://wa.me/?text=" + quote(_msg_inv)
+                    _n_ok = int(_est_sb.get("invitados_compraron") or 0)
+                    _n_gan = int(_est_sb.get("premios_total") or 0)
+                    st.markdown(
+                        "<details style='background:#F1F5F9;border:1px solid #D6DEE6;border-radius:10px;padding:6px 10px;margin:2px 0 8px 0;'>"
+                        "<summary style='cursor:pointer;font-size:12.5px;font-weight:700;color:#12304A;'>🎁 Invita y gana +" + str(LEDA_REF_PREMIO)
+                        + " crédito" + ("s" if LEDA_REF_PREMIO != 1 else "") + "</summary>"
+                        "<div style='font-size:11.5px;color:#334452;margin-top:6px;line-height:1.35;'>"
+                        "Cuando tu invitado compre su primer paquete (desde " + str(LEDA_REF_MIN) + " créditos), tú ganas "
+                        + str(LEDA_REF_PREMIO) + ". Tu enlace:</div>"
+                        "<input readonly value='" + _html.escape(_enlace_inv, quote=True) + "' "
+                        "style='width:100%;box-sizing:border-box;margin:5px 0;font-size:11px;padding:5px 6px;border:1px solid #C5D2DD;"
+                        "border-radius:6px;background:#ffffff;color:#12304A;'>"
+                        "<a href='" + _html.escape(_wa_inv, quote=True) + "' target='_blank' rel='noopener noreferrer' "
+                        "style='display:block;text-align:center;background:#25D366;color:#ffffff;font-weight:800;font-size:12px;"
+                        "border-radius:999px;padding:7px 8px;text-decoration:none;'>💬 Compartir por WhatsApp</a>"
+                        "<div style='font-size:11px;color:#5B6B78;margin-top:6px;'>Invitados que ya compraron: " + str(_n_ok)
+                        + " · Créditos ganados: " + str(_n_gan) + "</div></details>",
+                        unsafe_allow_html=True,
+                    )
             if LEDA_ES_VENDEDOR:
                 st.markdown(
                     "<div style='background:#F1F5F9;border:1px solid #D6DEE6;border-radius:10px;padding:5px 10px;margin:2px 0 6px 0;"
@@ -7370,6 +7439,17 @@ if LEDA_CREDITOS_ACTIVOS and (LEDA_ES_ADMIN or LEDA_ES_VENDEDOR):
     with st.expander(_titulo_panel, expanded=False):
         if LEDA_ES_VENDEDOR:
             st.caption("Puedes cargar hasta " + str(LEDA_VENDEDOR_MAX) + " créditos por operación. Cada recarga queda registrada con tu correo.")
+        if LEDA_ES_ADMIN:
+            _rs = _leda_rpc("leda_resumen", {})
+            if isinstance(_rs, dict):
+                st.markdown(
+                    "**Hoy:** " + str(_rs.get("cuentas_hoy", 0)) + " cuentas nuevas (" + str(_rs.get("invitados_hoy", 0)) + " por invitación) · "
+                    + str(_rs.get("gratis_hoy", 0)) + " créditos de bienvenida entregados · sin bienvenida: "
+                    + str(_rs.get("duplicado_hoy", 0)) + " repetidos, " + str(_rs.get("descartable_hoy", 0)) + " temporales, "
+                    + str(_rs.get("tope_dia_hoy", 0)) + " por tope diario · " + str(_rs.get("usos_hoy", 0)) + " trabajos resueltos · "
+                    + str(_rs.get("recargas_hoy", 0)) + " créditos recargados · " + str(_rs.get("premios_hoy", 0))
+                    + " créditos de premio · cuentas en total: " + str(_rs.get("cuentas_total", 0))
+                )
         _adm_email = st.text_input("Correo del estudiante", key="leda_adm_email").strip().lower()
         _a1, _a2 = st.columns(2)
         _tope_cant = 500 if LEDA_ES_ADMIN else max(1, LEDA_VENDEDOR_MAX)
@@ -7394,12 +7474,20 @@ if LEDA_CREDITOS_ACTIVOS and (LEDA_ES_ADMIN or LEDA_ES_VENDEDOR):
                 _res = _leda_rpc("leda_agregar", {
                     "p_email": _adm_email, "p_cantidad": int(_adm_cant), "p_vence": _adm_vence,
                     "p_nota": _adm_nota, "p_admin": TANA_AUTH_EMAIL,
+                    "p_min_ref": LEDA_REF_MIN, "p_premio": LEDA_REF_PREMIO, "p_tope_mes": LEDA_REF_TOPE_MES,
                 })
                 if _res is None:
                     st.error("No se pudo conectar con la base de datos: " + str(st.session_state.get("leda_ultimo_error", ""))[:200])
                 elif _res.get("ok"):
                     st.success("Listo: " + str(_res.get("email")) + " ahora tiene " + str(_res.get("creditos"))
                                + " créditos pagados, vigentes hasta " + _leda_fecha(_res.get("vence")) + ".")
+                    _prem = _res.get("premio")
+                    if isinstance(_prem, dict):
+                        if int(_prem.get("creditos") or 0) > 0:
+                            st.info("🎁 Se premió a " + str(_prem.get("para")) + " con " + str(_prem.get("creditos"))
+                                    + " crédito(s) por haber invitado a este estudiante.")
+                        else:
+                            st.info("El invitador (" + str(_prem.get("para")) + ") ya alcanzó su tope de premios este mes.")
                 else:
                     st.error("Ese correo todavía no tiene cuenta en LEDA. Pídele que ingrese al menos una vez y vuelve a intentar.")
 
